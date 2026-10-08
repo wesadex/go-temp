@@ -84,6 +84,7 @@ func (m *Broker) extendTopic(topicAddr *Topic) {
 	tb := &TopicBlock{
 		data: new([topicBlockSize]string),
 	}
+	topicAddr.tail.next = tb
 	topicAddr.tail = tb
 	topicAddr.tailOffset = 0
 }
