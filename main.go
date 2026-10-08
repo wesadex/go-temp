@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -21,8 +20,10 @@ const topicBlockSize int = 16
 
 type IBroker interface {
 	Send(string, string)
-	Recv(string) string
+	Recv(string) (string, error)
 }
+
+var _ IBroker = (*Broker)(nil)
 
 type TopicBlock struct {
 	data *[topicBlockSize]string
@@ -30,12 +31,11 @@ type TopicBlock struct {
 }
 
 type Topic struct {
-	blocks     *TopicBlock
 	head       *TopicBlock
 	tail       *TopicBlock
 	headOffset int
 	tailOffset int
-	tmu        sync.RWMutex
+	tmu        sync.Mutex
 }
 
 type Broker struct {
@@ -43,7 +43,7 @@ type Broker struct {
 	mu      sync.Mutex
 }
 
-func NewMQBroker(ctx context.Context, ttl time.Duration) *Broker {
+func NewMQBroker() *Broker {
 	m := Broker{
 		storage: make(map[string]*Topic),
 	}
@@ -56,9 +56,8 @@ func (m *Broker) createTopic(topic string) *Topic {
 	}
 
 	t := &Topic{
-		blocks: tb,
-		head:   tb,
-		tail:   tb,
+		head: tb,
+		tail: tb,
 	}
 	m.storage[topic] = t
 	return t
@@ -70,30 +69,26 @@ func (m *Broker) ensureTopicExists(topic string) *Topic {
 	t, ok := m.storage[topic]
 	if !ok {
 		// и создаем, если нет
-		newTopic := m.createTopic(topic)
-		m.storage[topic] = newTopic
-		return newTopic
+		return m.createTopic(topic)
 	}
 	return t
 }
 
-func (m *Broker) extendTopic(topicAddr *Topic) {
+func (m *Broker) sendToTopic(topicAddr *Topic, message string) {
+	// Проверка заполненности, расширение и запись — одна критическая секция
 	topicAddr.tmu.Lock()
 	defer topicAddr.tmu.Unlock()
 
-	tb := &TopicBlock{
-		data: new([topicBlockSize]string),
+	if topicAddr.tailOffset == topicBlockSize { // То есть у нас заполнен очередной блок, нужен новый
+		tb := &TopicBlock{
+			data: new([topicBlockSize]string),
+		}
+		topicAddr.tail.next = tb // прицепляем к цепочке, иначе читатель его не найдет
+		topicAddr.tail = tb
+		topicAddr.tailOffset = 0
 	}
-	topicAddr.tail.next = tb
-	topicAddr.tail = tb
-	topicAddr.tailOffset = 0
-}
-
-func (m *Broker) sendToTopic(topicAddr *Topic, message string) {
-	topicAddr.tmu.Lock()
 	topicAddr.tail.data[topicAddr.tailOffset] = message
 	topicAddr.tailOffset++
-	topicAddr.tmu.Unlock()
 }
 
 func (m *Broker) recvFromTopic(topicAddr *Topic) (string, error) {
@@ -115,6 +110,7 @@ func (m *Broker) recvFromTopic(topicAddr *Topic) (string, error) {
 	}
 
 	res := topicAddr.head.data[topicAddr.headOffset]
+	topicAddr.head.data[topicAddr.headOffset] = "" // не держим прочитанную строку
 	topicAddr.headOffset++
 	return res, nil
 }
@@ -124,10 +120,7 @@ func (m *Broker) Send(topic string, message string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	top := m.ensureTopicExists(topic)     // Получили топик
-	if top.tailOffset == topicBlockSize { // То есть у нас заполнен очередной блок, нужен новый
-		m.extendTopic(top) // расширили
-	}
+	top := m.ensureTopicExists(topic) // Получили топик
 	m.sendToTopic(top, message)
 }
 
@@ -157,8 +150,8 @@ type consumerStats struct {
 
 func main() {
 	total := 10_000_000
-	producers := 10000
-	consumers := 3500
+	producers := 1000
+	consumers := 500
 	cpuProf := ""
 	mutexProf := ""
 	topics := 16 // число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics
@@ -186,7 +179,7 @@ func main() {
 		defer writeProfile("mutex", mutexProf)
 	}
 
-	broker := NewMQBroker(context.Background(), time.Minute)
+	broker := NewMQBroker()
 
 	// Проверка доставки: бит на каждое сообщение (250 млн сообщений — ~30 МБ).
 	seen := make([]atomic.Uint64, (total+63)/64)
