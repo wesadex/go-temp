@@ -39,39 +39,32 @@ type Topic struct {
 }
 
 type Broker struct {
-	storage map[string]*Topic
-	mu      sync.Mutex
+	storage sync.Map // string -> *Topic
 }
 
 func NewMQBroker() *Broker {
-	m := Broker{
-		storage: make(map[string]*Topic),
-	}
-	return &m
+	return &Broker{}
 }
 
-func (m *Broker) createTopic(topic string) *Topic {
+func newTopic() *Topic {
 	tb := &TopicBlock{
 		data: new([topicBlockSize]string),
 	}
 
-	t := &Topic{
+	return &Topic{
 		head: tb,
 		tail: tb,
 	}
-	m.storage[topic] = t
-	return t
 }
 
 func (m *Broker) ensureTopicExists(topic string) *Topic {
-	// Проверяем есть ли такой топик
-	// Мьютекс нужен в вызывающей функции!
-	t, ok := m.storage[topic]
-	if !ok {
-		// и создаем, если нет
-		return m.createTopic(topic)
+	// Быстрый путь: топик уже есть, без аллокаций
+	if t, ok := m.storage.Load(topic); ok {
+		return t.(*Topic)
 	}
-	return t
+	// Медленный путь: создаем. Если другой Send успел раньше — берем его топик, наш выбрасываем
+	t, _ := m.storage.LoadOrStore(topic, newTopic())
+	return t.(*Topic)
 }
 
 func (m *Broker) sendToTopic(topicAddr *Topic, message string) {
@@ -116,24 +109,17 @@ func (m *Broker) recvFromTopic(topicAddr *Topic) (string, error) {
 }
 
 func (m *Broker) Send(topic string, message string) {
-	// Лок на мапу
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	top := m.ensureTopicExists(topic) // Получили топик
 	m.sendToTopic(top, message)
 }
 
 func (m *Broker) Recv(topic string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	// Проверяем есть ли такой топик
-	t, ok := m.storage[topic]
+	t, ok := m.storage.Load(topic)
 	if !ok {
 		return "", ErrTopicNotFound
 	}
-	return m.recvFromTopic(t)
+	return m.recvFromTopic(t.(*Topic))
 }
 
 // TESTS
