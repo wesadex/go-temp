@@ -107,8 +107,15 @@ func (m *Broker) recvFromTopic(topicAddr *Topic) (string, error) {
 		topicAddr.headOffset = 0
 	}
 
+	if topicAddr.head == topicAddr.tail {
+		if topicAddr.headOffset == topicAddr.tailOffset { // голова и хвост - одно и то же, оба указателя - одно и то же
+			return "", ErrTopicEmpty
+		}
+	}
+
+	res := topicAddr.head.data[topicAddr.headOffset]
 	topicAddr.headOffset++
-	return topicAddr.head.data[topicAddr.headOffset], nil
+	return res, nil
 }
 
 func (m *Broker) Send(topic string, message string) {
