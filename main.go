@@ -69,7 +69,7 @@ func main() {
 		defer writeProfile("mutex", mutexProf)
 	}
 
-	broker := NewMQBroker()
+	broker := NewGPTBroker()
 
 	// Проверка доставки: бит на каждое сообщение (250 млн сообщений — ~30 МБ).
 	seen := make([]atomic.Uint64, (total+63)/64)

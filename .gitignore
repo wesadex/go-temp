@@ -1,3 +1,8 @@
 .vscode/
 main
 mqbench
+gptbench
+bench-20261008-215148/full.log
+bench-20261008-215148/results.csv
+bench-20261008-215917/full.log
+bench-20261008-215917/results.csv
