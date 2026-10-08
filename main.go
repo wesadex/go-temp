@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -24,12 +25,26 @@ type consumerStats struct {
 }
 
 func main() {
-	total := 100_000_000
-	producers := 3
-	consumers := 3
-	cpuProf := ""
-	mutexProf := ""
-	topics := 1 // число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics
+	// total := 100_000_000
+	// producers := 1000
+	// consumers := 800
+	// cpuProf := ""
+	// mutexProf := ""
+	// topics := 100 // число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics
+
+	var (
+		totalFlag     = flag.Int("total", 100_000_000, "сколько сообщений отправить")
+		producersFlag = flag.Int("producers", 1000, "число горутин-продюсеров")
+		consumersFlag = flag.Int("consumers", 800, "число горутин-консьюмеров")
+		topicsFlag    = flag.Int("topics", 100, "число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics")
+		cpuProfFlag   = flag.String("cpuprofile", "", "записать CPU-профиль в файл")
+		mutexProfFlag = flag.String("mutexprofile", "", "записать профиль ожидания мьютексов в файл")
+	)
+	flag.Parse()
+
+	// Дальше по коду используются обычные переменные, а не указатели.
+	total, producers, consumers, topics := *totalFlag, *producersFlag, *consumersFlag, *topicsFlag
+	cpuProf, mutexProf := *cpuProfFlag, *mutexProfFlag
 
 	// У каждого топика должен быть хотя бы один продюсер и один консьюмер,
 	// иначе топик либо пуст, либо его никто не вычитает и тест зависнет.
