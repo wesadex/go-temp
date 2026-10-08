@@ -1,0 +1,6 @@
+{
+  "go.goroot": "/opt/homebrew/opt/go/libexec",
+  "go.alternateTools": {
+    "go": "/opt/homebrew/opt/go/bin/go"
+  }
+}
