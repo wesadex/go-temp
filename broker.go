@@ -24,16 +24,16 @@ var _ IBroker = (*Broker)(nil)
 // Блок — единственное место, через которое общаются продюсеры и консьюмеры.
 // Всё, что одна сторона пишет, а другая читает, — атомики.
 type TopicBlock struct {
-	data    [topicBlockSize]string     // встроенный массив: одна аллокация на блок
+	data    [topicBlockSize]string
 	written atomic.Int32               // сколько слотов опубликовано; пишет продюсер, читает консьюмер
 	next    atomic.Pointer[TopicBlock] // следующий блок; пишет продюсер, читает консьюмер
 }
 
 // Указатель на блок со своим локом: один для головы, один для хвоста.
 type TopicBlockPointer struct {
-	tbmu       sync.Mutex
+	mu         sync.Mutex
 	topicBlock *TopicBlock
-	offset     int // позиция чтения; используется только головой, под tbmu
+	offset     int // позиция чтения; используется только головой, под mu
 	// Добиваем до кэш-линии, чтобы лок головы и лок хвоста
 	// не делили одну линию (false sharing).
 	_ [cacheLineSize - 24]byte
@@ -68,8 +68,8 @@ func (m *Broker) ensureTopicExists(topic string) *Topic {
 
 func (m *Broker) sendToTopic(t *Topic, message string) {
 	// Под локом хвоста: голову не трогаем вообще
-	t.tail.tbmu.Lock()
-	defer t.tail.tbmu.Unlock()
+	t.tail.mu.Lock()
+	defer t.tail.mu.Unlock()
 
 	tb := t.tail.topicBlock
 	w := tb.written.Load()        // пишем только мы, но читаем атомарно, т.к. поле атомарное
@@ -85,8 +85,8 @@ func (m *Broker) sendToTopic(t *Topic, message string) {
 
 func (m *Broker) recvFromTopic(t *Topic) (string, error) {
 	// Под локом головы: хвост не трогаем вообще
-	t.head.tbmu.Lock()
-	defer t.head.tbmu.Unlock()
+	t.head.mu.Lock()
+	defer t.head.mu.Unlock()
 
 	tb, r := t.head.topicBlock, t.head.offset
 	if r == topicBlockSize { // дочитали блок до конца

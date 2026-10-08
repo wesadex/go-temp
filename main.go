@@ -24,12 +24,12 @@ type consumerStats struct {
 }
 
 func main() {
-	total := 10_000_000
-	producers := 1000
-	consumers := 500
+	total := 100_000_000
+	producers := 3
+	consumers := 3
 	cpuProf := ""
 	mutexProf := ""
-	topics := 16 // число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics
+	topics := 1 // число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics
 
 	// У каждого топика должен быть хотя бы один продюсер и один консьюмер,
 	// иначе топик либо пуст, либо его никто не вычитает и тест зависнет.
