@@ -11,6 +11,9 @@ var ErrTopicEmpty = errors.New("topic is empty")
 
 const topicBlockSize int = 256
 
+// Размер кэш-линии на Apple Silicon. На x86 — 64, но 128 безопасно и там.
+const cacheLineSize = 128
+
 type IBroker interface {
 	Send(string, string)
 	Recv(string) (string, error)
@@ -18,23 +21,27 @@ type IBroker interface {
 
 var _ IBroker = (*Broker)(nil)
 
+// Блок — единственное место, через которое общаются продюсеры и консьюмеры.
+// Всё, что одна сторона пишет, а другая читает, — атомики.
 type TopicBlock struct {
-	data *[topicBlockSize]string
-	next *TopicBlock
+	data    [topicBlockSize]string     // встроенный массив: одна аллокация на блок
+	written atomic.Int32               // сколько слотов опубликовано; пишет продюсер, читает консьюмер
+	next    atomic.Pointer[TopicBlock] // следующий блок; пишет продюсер, читает консьюмер
 }
 
+// Указатель на блок со своим локом: один для головы, один для хвоста.
 type TopicBlockPointer struct {
-	topicBlock *TopicBlock
-	offset     atomic.Int32
 	tbmu       sync.Mutex
+	topicBlock *TopicBlock
+	offset     int // позиция чтения; используется только головой, под tbmu
+	// Добиваем до кэш-линии, чтобы лок головы и лок хвоста
+	// не делили одну линию (false sharing).
+	_ [cacheLineSize - 24]byte
 }
 
 type Topic struct {
-	head       *TopicBlock
-	tail       *TopicBlock
-	headOffset int
-	tailOffset int
-	tmu        sync.Mutex
+	head TopicBlockPointer // только консьюмеры
+	tail TopicBlockPointer // только продюсеры
 }
 
 type Broker struct {
@@ -42,14 +49,11 @@ type Broker struct {
 }
 
 func newTopic() *Topic {
-	tb := &TopicBlock{
-		data: new([topicBlockSize]string),
-	}
-
-	return &Topic{
-		head: tb,
-		tail: tb,
-	}
+	tb := &TopicBlock{}
+	t := &Topic{}
+	t.head.topicBlock = tb
+	t.tail.topicBlock = tb
+	return t
 }
 
 func (m *Broker) ensureTopicExists(topic string) *Topic {
@@ -62,44 +66,46 @@ func (m *Broker) ensureTopicExists(topic string) *Topic {
 	return t.(*Topic)
 }
 
-func (m *Broker) sendToTopic(topicAddr *Topic, message string) {
-	// Проверка заполненности, расширение и запись — одна критическая секция
-	topicAddr.tmu.Lock()
-	defer topicAddr.tmu.Unlock()
+func (m *Broker) sendToTopic(t *Topic, message string) {
+	// Под локом хвоста: голову не трогаем вообще
+	t.tail.tbmu.Lock()
+	defer t.tail.tbmu.Unlock()
 
-	if topicAddr.tailOffset == topicBlockSize { // То есть у нас заполнен очередной блок, нужен новый
-		tb := &TopicBlock{
-			data: new([topicBlockSize]string),
-		}
-		topicAddr.tail.next = tb // прицепляем к цепочке, иначе читатель его не найдет
-		topicAddr.tail = tb      // хвост теперь - новый блок
-		topicAddr.tailOffset = 0 // указатель записи - в начало нового блока-хвоста
+	tb := t.tail.topicBlock
+	w := tb.written.Load()        // пишем только мы, но читаем атомарно, т.к. поле атомарное
+	if int(w) == topicBlockSize { // блок заполнен, нужен новый
+		nb := &TopicBlock{}
+		tb.next.Store(nb)      // СНАЧАЛА публикуем новый блок для консьюмеров
+		t.tail.topicBlock = nb // потом переставляем хвост
+		tb, w = nb, 0
 	}
-	topicAddr.tail.data[topicAddr.tailOffset] = message
-	topicAddr.tailOffset++
+	tb.data[w] = message    // СНАЧАЛА пишем слот...
+	tb.written.Store(w + 1) // ...потом публикуем: консьюмер увидит слот только после этого
 }
 
-func (m *Broker) recvFromTopic(topicAddr *Topic) (string, error) {
-	topicAddr.tmu.Lock()
-	defer topicAddr.tmu.Unlock()
+func (m *Broker) recvFromTopic(t *Topic) (string, error) {
+	// Под локом головы: хвост не трогаем вообще
+	t.head.tbmu.Lock()
+	defer t.head.tbmu.Unlock()
 
-	if topicAddr.headOffset == topicBlockSize { // Достигли конца блока с чтением
-		if topicAddr.head.next == nil { // если дальше блоков нет - ошибка, нечего читать
+	tb, r := t.head.topicBlock, t.head.offset
+	if r == topicBlockSize { // дочитали блок до конца
+		nb := tb.next.Load()
+		if nb == nil { // следующего блока ещё нет — читать нечего
 			return "", ErrTopicEmpty
 		}
-		topicAddr.head = topicAddr.head.next // переставляем указатель - голова теперь следуюший блок
-		topicAddr.headOffset = 0
+		// Переходим на следующий блок. Старый больше никто не держит — его заберёт GC.
+		t.head.topicBlock, t.head.offset = nb, 0
+		tb, r = nb, 0
 	}
 
-	if topicAddr.head == topicAddr.tail { //  если голова и хвост - один блок...
-		if topicAddr.headOffset == topicAddr.tailOffset { // и оба указателя - одинаковые, то читать нечего больше
-			return "", ErrTopicEmpty
-		}
+	if r >= int(tb.written.Load()) { // всё опубликованное в блоке уже прочитано
+		return "", ErrTopicEmpty
 	}
 
-	res := topicAddr.head.data[topicAddr.headOffset]
-	topicAddr.head.data[topicAddr.headOffset] = "" // не держим прочитанную строку
-	topicAddr.headOffset++
+	res := tb.data[r]
+	tb.data[r] = "" // не держим прочитанную строку
+	t.head.offset = r + 1
 	return res, nil
 }
 
