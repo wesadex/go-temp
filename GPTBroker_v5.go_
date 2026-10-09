@@ -1,0 +1,163 @@
+package main
+
+import (
+	"sync"
+	"sync/atomic"
+)
+
+const topBlockSize = 256
+
+var blockPool = sync.Pool{New: func() any { return new(topicBlock) }}
+
+func getBlock() *topicBlock {
+	b := blockPool.Get().(*topicBlock)
+	b.next = nil
+	b.n = 0
+	return b
+}
+
+func putBlock(b *topicBlock) {
+	b.next = nil
+	b.n = 0
+	blockPool.Put(b)
+}
+
+type topicBlock struct {
+	next *topicBlock
+	n    uint16
+	data [topicBlockSize]string
+}
+
+// Producer and consumer locks deliberately live on separate cache lines.
+type producerSide struct {
+	mu      sync.Mutex
+	head    *topicBlock
+	tail    *topicBlock
+	tailPos uint16
+	_       [32]byte
+}
+
+type consumerSide struct {
+	mu   sync.Mutex
+	head *topicBlock
+	pos  uint16
+	_    [32]byte
+}
+
+type topicQueue struct {
+	p producerSide
+	c consumerSide
+}
+
+type topicEntry struct {
+	name string
+	q    *topicQueue
+}
+
+type GPTBroker struct {
+	topics sync.Map
+	first  atomic.Pointer[topicEntry]
+	multi  atomic.Bool
+}
+
+func NewGPTV5Broker() *GPTBroker { return &GPTBroker{} }
+
+func (b *GPTBroker) lookup(topic string, create bool) *topicQueue {
+	if !b.multi.Load() {
+		if e := b.first.Load(); e != nil && e.name == topic {
+			return e.q
+		}
+	}
+	if v, ok := b.topics.Load(topic); ok {
+		return v.(*topicEntry).q
+	}
+	if !create {
+		return nil
+	}
+
+	e := &topicEntry{name: topic, q: &topicQueue{}}
+	v, loaded := b.topics.LoadOrStore(topic, e)
+	if loaded {
+		return v.(*topicEntry).q
+	}
+	if !b.first.CompareAndSwap(nil, e) {
+		b.multi.Store(true)
+	}
+	return e.q
+}
+
+func (b *GPTBroker) Send(topic, msg string) {
+	q := b.lookup(topic, true)
+	p := &q.p
+	p.mu.Lock()
+
+	if p.tail == nil {
+		blk := getBlock()
+		p.head, p.tail = blk, blk
+		p.tailPos = 0
+	} else if p.tailPos == topBlockSize {
+		blk := getBlock()
+		p.tail.n = topBlockSize
+		p.tail.next = blk
+		p.tail = blk
+		p.tailPos = 0
+	}
+
+	p.tail.data[p.tailPos] = msg
+	p.tailPos++
+	p.tail.n = p.tailPos
+	p.mu.Unlock()
+}
+
+func (b *GPTBroker) Recv(topic string) (string, error) {
+	q := b.lookup(topic, false)
+	if q == nil {
+		return "", ErrTopicNotFound
+	}
+
+	c := &q.c
+	c.mu.Lock()
+
+	// Advance past a consumed block in our private batch.
+	if c.head != nil && c.pos == c.head.n {
+		old := c.head
+		c.head = old.next
+		old.next = nil
+		c.pos = 0
+	}
+
+	// No private batch: atomically (under producer lock) take everything that
+	// producers accumulated so far. Producers immediately continue in a fresh
+	// chain, so consumer and producer never touch the same message block.
+	if c.head == nil {
+		p := &q.p
+		p.mu.Lock()
+		if p.head == nil {
+			p.mu.Unlock()
+			c.mu.Unlock()
+			return "", ErrTopicEmpty
+		}
+		c.head = p.head
+		c.pos = 0
+		// n on the current producer tail is finalized by the lock handoff.
+		p.head, p.tail, p.tailPos = nil, nil, 0
+		p.mu.Unlock()
+	}
+
+	blk := c.head
+	msg := blk.data[c.pos]
+	blk.data[c.pos] = ""
+	c.pos++
+
+	// Detach immediately when this was the last element of the batch/block,
+	// allowing GC to reclaim it before the next Recv.
+	if c.pos == blk.n {
+		c.head = blk.next
+		blk.next = nil
+		putBlock(blk)
+		c.pos = 0
+	}
+
+	c.mu.Unlock()
+	return msg, nil
+}

@@ -13,3 +13,10 @@ bench-20261008-225015/results.csv
 bench-20261008-225041/full.log
 bench-20261008-225041/results.csv
 gptv3bench
+bench-20261008-231018/full.log
+bench-20261008-231018/results.csv
+gpt-gogc400/full.log
+gpt-gogc400/results.csv
+ours-gogc400/full.log
+ours-gogc400/results.csv
+gptv5bench
