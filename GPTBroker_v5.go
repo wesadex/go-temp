@@ -5,9 +5,10 @@ import (
 	"sync/atomic"
 )
 
-const topBlockSize = 256
-
-var blockPool = sync.Pool{New: func() any { return new(topicBlock) }}
+var blockPool = sync.Pool{
+	New: func() any {
+		return new(topicBlock)
+	}}
 
 func getBlock() *topicBlock {
 	b := blockPool.Get().(*topicBlock)
@@ -54,15 +55,15 @@ type topicEntry struct {
 	q    *topicQueue
 }
 
-type GPTBroker struct {
+type GPTV5Broker struct {
 	topics sync.Map
 	first  atomic.Pointer[topicEntry]
 	multi  atomic.Bool
 }
 
-func NewGPTV5Broker() *GPTBroker { return &GPTBroker{} }
+func NewGPTV5Broker() *GPTV5Broker { return &GPTV5Broker{} }
 
-func (b *GPTBroker) lookup(topic string, create bool) *topicQueue {
+func (b *GPTV5Broker) lookup(topic string, create bool) *topicQueue {
 	if !b.multi.Load() {
 		if e := b.first.Load(); e != nil && e.name == topic {
 			return e.q
@@ -86,7 +87,7 @@ func (b *GPTBroker) lookup(topic string, create bool) *topicQueue {
 	return e.q
 }
 
-func (b *GPTBroker) Send(topic, msg string) {
+func (b *GPTV5Broker) Send(topic, msg string) {
 	q := b.lookup(topic, true)
 	p := &q.p
 	p.mu.Lock()
@@ -95,9 +96,9 @@ func (b *GPTBroker) Send(topic, msg string) {
 		blk := getBlock()
 		p.head, p.tail = blk, blk
 		p.tailPos = 0
-	} else if p.tailPos == topBlockSize {
+	} else if p.tailPos == topicBlockSize {
 		blk := getBlock()
-		p.tail.n = topBlockSize
+		p.tail.n = topicBlockSize
 		p.tail.next = blk
 		p.tail = blk
 		p.tailPos = 0
@@ -109,7 +110,7 @@ func (b *GPTBroker) Send(topic, msg string) {
 	p.mu.Unlock()
 }
 
-func (b *GPTBroker) Recv(topic string) (string, error) {
+func (b *GPTV5Broker) Recv(topic string) (string, error) {
 	q := b.lookup(topic, false)
 	if q == nil {
 		return "", ErrTopicNotFound

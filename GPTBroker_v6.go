@@ -5,18 +5,26 @@ import (
 	"sync/atomic"
 )
 
-const blockN = 256
-
 type block struct {
 	next atomic.Pointer[block]
 	n    uint16
-	data [blockN]string
+	data [topicBlockSize]string
 }
 
 var bp = sync.Pool{New: func() any { return new(block) }}
 
-func gb() *block  { x := bp.Get().(*block); x.next.Store(nil); x.n = 0; return x }
-func pb(x *block) { x.next.Store(nil); x.n = 0; bp.Put(x) }
+func gb() *block {
+	x := bp.Get().(*block)
+	x.next.Store(nil)
+	x.n = 0
+	return x
+}
+
+func pb(x *block) {
+	x.next.Store(nil)
+	x.n = 0
+	bp.Put(x)
+}
 
 type prod struct {
 	mu      sync.Mutex
@@ -25,12 +33,14 @@ type prod struct {
 	pubTail *block
 	_       [32]byte
 }
+
 type cons struct {
 	mu   sync.Mutex
 	head *block
 	pos  uint16
 	_    [32]byte
 }
+
 type queue struct {
 	p    prod
 	c    cons
@@ -49,15 +59,16 @@ type ent struct {
 	name string
 	q    *queue
 }
-type GPTBroker struct {
+
+type GPTV6Broker struct {
 	topics sync.Map
 	first  atomic.Pointer[ent]
 	multi  atomic.Bool
 }
 
-func NewGPTBroker() *GPTBroker { return &GPTBroker{} }
+func NewGPTV6Broker() *GPTV6Broker { return &GPTV6Broker{} }
 
-func (b *GPTBroker) lookup(t string, create bool) *queue {
+func (b *GPTV6Broker) lookup(t string, create bool) *queue {
 	if !b.multi.Load() {
 		if e := b.first.Load(); e != nil && e.name == t {
 			return e.q
@@ -80,7 +91,7 @@ func (b *GPTBroker) lookup(t string, create bool) *queue {
 	return e.q
 }
 
-func (b *GPTBroker) Send(t, m string) {
+func (b *GPTV6Broker) Send(t, m string) {
 	q := b.lookup(t, true)
 	p := &q.p
 	p.mu.Lock()
@@ -92,8 +103,8 @@ func (b *GPTBroker) Send(t, m string) {
 	}
 	x.data[p.n] = m
 	p.n++
-	if p.n == blockN {
-		x.n = blockN
+	if p.n == topicBlockSize {
+		x.n = topicBlockSize
 		p.cur = nil
 		p.n = 0
 		p.pubTail.next.Store(x)
@@ -102,7 +113,7 @@ func (b *GPTBroker) Send(t, m string) {
 	p.mu.Unlock()
 }
 
-func (b *GPTBroker) Recv(t string) (string, error) {
+func (b *GPTV6Broker) Recv(t string) (string, error) {
 	q := b.lookup(t, false)
 	if q == nil {
 		return "", ErrTopicNotFound

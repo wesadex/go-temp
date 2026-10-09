@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 )
 
-var _ IBroker = (*GPTBroker)(nil)
+var _ IBroker = (*GPTV3Broker)(nil)
 
 const topBlockSize = 256
 
@@ -27,17 +27,17 @@ type topicEntry struct {
 	name string
 	q    *topicQueue
 }
-type GPTBroker struct {
+type GPTV3Broker struct {
 	topics sync.Map // map[string]*topicEntry
 	first  atomic.Pointer[topicEntry]
 	multi  atomic.Bool
 }
 
-func NewGPTV3Broker() *GPTBroker {
-	return &GPTBroker{}
+func NewGPTV3Broker() *GPTV3Broker {
+	return &GPTV3Broker{}
 }
 
-func (b *GPTBroker) lookup(topic string, create bool) *topicQueue {
+func (b *GPTV3Broker) lookup(topic string, create bool) *topicQueue {
 	if !b.multi.Load() {
 		if e := b.first.Load(); e != nil && e.name == topic {
 			return e.q
@@ -60,7 +60,7 @@ func (b *GPTBroker) lookup(topic string, create bool) *topicQueue {
 	return e.q
 }
 
-func (b *GPTBroker) Send(topic, msg string) {
+func (b *GPTV3Broker) Send(topic, msg string) {
 	q := b.lookup(topic, true)
 
 	q.mu.Lock()
@@ -84,7 +84,7 @@ func (b *GPTBroker) Send(topic, msg string) {
 	q.mu.Unlock()
 }
 
-func (b *GPTBroker) Recv(topic string) (string, error) {
+func (b *GPTV3Broker) Recv(topic string) (string, error) {
 	q := b.lookup(topic, false)
 	if q == nil {
 		return "", ErrTopicNotFound

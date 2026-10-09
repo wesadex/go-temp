@@ -1,23 +1,9 @@
 package main
 
 import (
-	"errors"
 	"sync"
 	"sync/atomic"
 )
-
-var ErrTopicNotFound = errors.New("topic not found")
-var ErrTopicEmpty = errors.New("topic is empty")
-
-const topicBlockSize int = 256
-
-// Размер кэш-линии на Apple Silicon. На x86 — 64, но 128 безопасно и там.
-const cacheLineSize = 128
-
-type IBroker interface {
-	Send(string, string)
-	Recv(string) (string, error)
-}
 
 var _ IBroker = (*Broker)(nil)
 
@@ -72,8 +58,8 @@ func (m *Broker) sendToTopic(t *Topic, message string) {
 	defer t.tail.mu.Unlock()
 
 	tb := t.tail.topicBlock
-	w := tb.written.Load()        // пишем только мы, но читаем атомарно, т.к. поле атомарное
-	if int(w) == topicBlockSize { // блок заполнен, нужен новый
+	w := tb.written.Load()           // пишем только мы, но читаем атомарно, т.к. поле атомарное
+	if uint16(w) == topicBlockSize { // блок заполнен, нужен новый
 		nb := &TopicBlock{}
 		tb.next.Store(nb)      // СНАЧАЛА публикуем новый блок для консьюмеров
 		t.tail.topicBlock = nb // потом переставляем хвост
@@ -89,7 +75,7 @@ func (m *Broker) recvFromTopic(t *Topic) (string, error) {
 	defer t.head.mu.Unlock()
 
 	tb, r := t.head.topicBlock, t.head.offset
-	if r == topicBlockSize { // дочитали блок до конца
+	if r == int(topicBlockSize) { // дочитали блок до конца
 		nb := tb.next.Load()
 		if nb == nil { // следующего блока ещё нет — читать нечего
 			return "", ErrTopicEmpty

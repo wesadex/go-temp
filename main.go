@@ -14,17 +14,37 @@ import (
 	"time"
 )
 
-const topic = "events"
+var ErrTopicNotFound = errors.New("topic not found")
+var ErrTopicEmpty = errors.New("topic is empty")
 
-// Итоги одного консьюмера. Считаем локально и складываем в конце,
-// чтобы общий счётчик не стал ещё одной точкой конкуренции.
+const topicBlockSize uint16 = 256
+
+// Размер кэш-линии на Apple Silicon. На x86 — 64, но 128 безопасно и там.
+const cacheLineSize = 128
+
+type IBroker interface {
+	Send(string, string)
+	Recv(string) (string, error)
+}
+
+// Итоги одного консьюмера. Горутина копит их в локальной переменной
+// и записывает в общий срез один раз, при выходе: соседние элементы среза
+// лежат в одной кэш-линии, и запись в них на каждом сообщении
+// гоняла бы эту линию между ядрами (false sharing).
 type consumerStats struct {
 	received   int64
-	duplicates int64
-	emptyPolls int64 // Recv вернул «пусто» — холостой опрос
+	duplicates int64  // только при -verify
+	emptyPolls int64  // Recv вернул «пусто» — холостой опрос
+	sum        uint64 // сумма id, по модулю 2^64
+	sumSq      uint64 // сумма квадратов id, по модулю 2^64
 }
 
 func main() {
+	// broker := NewGPTV6Broker()
+	broker := NewGPTV5Broker()
+	// broker := NewGPTV3Broker()
+	// broker := NewMQBroker()
+
 	// total := 100_000_000
 	// producers := 1000
 	// consumers := 800
@@ -39,12 +59,14 @@ func main() {
 		topicsFlag    = flag.Int("topics", 100, "число топиков; продюсер p пишет в топик p%topics, консьюмер c читает топик c%topics")
 		cpuProfFlag   = flag.String("cpuprofile", "", "записать CPU-профиль в файл")
 		mutexProfFlag = flag.String("mutexprofile", "", "записать профиль ожидания мьютексов в файл")
+		verifyFlag    = flag.Bool("verify", false, "точная проверка через общий битсет (медленнее: консьюмеры делят его кэш-линии)")
 	)
 	flag.Parse()
 
 	// Дальше по коду используются обычные переменные, а не указатели.
 	total, producers, consumers, topics := *totalFlag, *producersFlag, *consumersFlag, *topicsFlag
 	cpuProf, mutexProf := *cpuProfFlag, *mutexProfFlag
+	verify := *verifyFlag
 
 	// У каждого топика должен быть хотя бы один продюсер и один консьюмер,
 	// иначе топик либо пуст, либо его никто не вычитает и тест зависнет.
@@ -69,10 +91,16 @@ func main() {
 		defer writeProfile("mutex", mutexProf)
 	}
 
-	broker := NewGPTV5Broker()
-
-	// Проверка доставки: бит на каждое сообщение (250 млн сообщений — ~30 МБ).
-	seen := make([]atomic.Uint64, (total+63)/64)
+	// Проверка доставки.
+	// По умолчанию — без общей памяти: каждый консьюмер локально считает
+	// количество, сумму и сумму квадратов id, а main сверяет их с ожидаемыми.
+	// Потеря или дубликат, сохраняющие все три величины, на практике не встречаются.
+	// С -verify — точная проверка битсетом (бит на сообщение, 250 млн — ~30 МБ),
+	// но консьюмеры одного топика пишут в одни и те же его кэш-линии.
+	var seen []atomic.Uint64
+	if verify {
+		seen = make([]atomic.Uint64, (total+63)/64)
+	}
 	var producersDone atomic.Bool
 
 	var memBefore runtime.MemStats
@@ -91,7 +119,8 @@ func main() {
 	for c := range consumers {
 		go func() {
 			defer consWG.Done()
-			st := &stats[c]
+			var st consumerStats             // локальная копия: никаких общих кэш-линий
+			defer func() { stats[c] = st }() // в общий срез — один раз, при выходе
 			topic := topicNames[c%topics]
 			ready.Done()
 			<-startGate
@@ -115,10 +144,15 @@ func main() {
 				if err != nil || id < 0 || id >= total {
 					log.Fatalf("битое сообщение %q", msg)
 				}
-				bit := uint64(1) << (id % 64)
-				if seen[id/64].Or(bit)&bit != 0 {
-					st.duplicates++
+				if verify {
+					bit := uint64(1) << (id % 64)
+					if seen[id/64].Or(bit)&bit != 0 {
+						st.duplicates++
+					}
 				}
+				u := uint64(id)
+				st.sum += u
+				st.sumSq += u * u
 				st.received++
 			}
 		}()
@@ -159,10 +193,20 @@ func main() {
 	runtime.ReadMemStats(&memAfter)
 
 	var received, duplicates, emptyPolls int64
+	var sum, sumSq uint64
 	for _, st := range stats {
 		received += st.received
 		duplicates += st.duplicates
 		emptyPolls += st.emptyPolls
+		sum += st.sum
+		sumSq += st.sumSq
+	}
+
+	// Ожидаемые суммы считаем тем же способом (по модулю 2^64), уже вне замера.
+	var wantSum, wantSumSq uint64
+	for id := range uint64(total) {
+		wantSum += id
+		wantSumSq += id * id
 	}
 
 	n := float64(total)
@@ -179,11 +223,16 @@ func main() {
 		time.Duration(memAfter.PauseTotalNs-memBefore.PauseTotalNs).Round(time.Microsecond),
 		(memAfter.TotalAlloc-memBefore.TotalAlloc)>>20)
 
-	if received != int64(total) || duplicates != 0 {
-		fmt.Printf("ОШИБКА: получено %d из %d, дубликатов %d\n", received, total, duplicates)
+	if received != int64(total) || duplicates != 0 || sum != wantSum || sumSq != wantSumSq {
+		fmt.Printf("ОШИБКА: получено %d из %d, дубликатов %d, суммы совпали: %v\n",
+			received, total, duplicates, sum == wantSum && sumSq == wantSumSq)
 		os.Exit(1)
 	}
-	fmt.Printf("OK: получено %d, дубликатов нет\n", received)
+	if verify {
+		fmt.Printf("OK: получено %d, дубликатов нет (битсет)\n", received)
+	} else {
+		fmt.Printf("OK: получено %d, контрольные суммы совпали\n", received)
+	}
 }
 
 func writeProfile(name, path string) {
